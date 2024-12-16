@@ -1,133 +1,162 @@
-#include <iostream>
-#include <fstream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <queue>
 #include <string>
 #include <vector>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <filesystem>
-#include <queue>
-#include <memory>
 
-namespace fs = std::filesystem;
-
-// Struct for task arguments
 struct CopyTask {
     std::string src;
     std::string dest;
     bool is_directory;
 };
 
-// Global variables for thread management
-std::vector<std::thread> workers;
-std::queue<CopyTask> tasks;
-std::mutex queue_mutex;
-std::condition_variable condition;
-bool stop = false;
+std::queue<pthread_t> thread_queue;
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void copy_file(const std::string &src, const std::string &dest) {
-    try {
-        std::ifstream src_stream(src, std::ios::binary);
-        std::ofstream dest_stream(dest, std::ios::binary);
-        dest_stream << src_stream.rdbuf();
-    } catch (const std::exception &e) {
-        std::cerr << "Error copying file " << src << " to " << dest << ": " << e.what() << std::endl;
+    int src_fd = open(src.c_str(), O_RDONLY);
+    if (src_fd == -1) {
+        perror("Failed to open source file");
+        return;
     }
-}
 
-void copy_directory(const std::string &src, const std::string &dest);
+    int dest_fd = open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dest_fd == -1) {
+        perror("Failed to open destination file");
+        close(src_fd);
+        return;
+    }
 
-void worker_thread() {
-    while (true) {
-        CopyTask task;
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            condition.wait(lock, [] { return stop || !tasks.empty(); });
-
-            if (stop && tasks.empty())
-                return;
-
-            task = std::move(tasks.front());
-            tasks.pop();
-        }
-
-        if (task.is_directory) {
-            copy_directory(task.src, task.dest);
-        } else {
-            copy_file(task.src, task.dest);
+    char buffer[4096];
+    ssize_t bytes_read;
+    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+        if (write(dest_fd, buffer, bytes_read) == -1) {
+            perror("Failed to write to destination file");
+            break;
         }
     }
+
+    if (bytes_read == -1) {
+        perror("Failed to read from source file");
+    }
+
+    close(src_fd);
+    close(dest_fd);
 }
 
-void copy_directory(const std::string &src, const std::string &dest) {
-    try {
-        fs::create_directories(dest);
-        for (const auto &entry : fs::directory_iterator(src)) {
-            std::string new_src = entry.path().string();
-            std::string new_dest = dest + "/" + entry.path().filename().string();
-            if (fs::is_directory(entry.path())) {
-                {
-                    std::unique_lock<std::mutex> lock(queue_mutex);
-                    tasks.push(CopyTask{new_src, new_dest, true});
-                }
-                condition.notify_one();
-            } else {
-                {
-                    std::unique_lock<std::mutex> lock(queue_mutex);
-                    tasks.push(CopyTask{new_src, new_dest, false});
-                }
-                condition.notify_one();
+
+void *process_task(void *arg) {
+    CopyTask *task = (CopyTask *)arg;
+
+    if (task->is_directory) {
+        DIR *dir = opendir(task->src.c_str());
+        if (!dir) {
+            perror("Failed to open source directory");
+            free(task);
+            return nullptr;
+        }
+
+        if (mkdir(task->dest.c_str(), 0755) == -1 && errno != EEXIST) {
+            perror("Failed to create directory");
+            closedir(dir);
+            free(task);
+            return nullptr;
+        }
+
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
             }
+
+            std::string new_src = task->src + "/" + entry->d_name;
+            std::string new_dest = task->dest + "/" + entry->d_name;
+
+            struct stat entry_stat;
+            if (stat(new_src.c_str(), &entry_stat) == -1) {
+                perror("Failed to get file status");
+                continue;
+            }
+
+            CopyTask *new_task = (CopyTask *)malloc(sizeof(CopyTask));
+            new_task->src = new_src;
+            new_task->dest = new_dest;
+            new_task->is_directory = S_ISDIR(entry_stat.st_mode);
+
+            pthread_t thread;
+            if (pthread_create(&thread, nullptr, process_task, new_task) != 0) {
+                perror("Failed to create thread");
+                free(new_task);
+                continue;
+            }
+
+            pthread_mutex_lock(&queue_mutex);
+            thread_queue.push(thread);
+            pthread_mutex_unlock(&queue_mutex);
         }
-    } catch (const std::exception &e) {
-        std::cerr << "Error copying directory " << src << " to " << dest << ": " << e.what() << std::endl;
+
+        closedir(dir);
+    } else {
+        copy_file(task->src, task->dest);
     }
+
+    free(task);
+    return nullptr;
 }
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <source> <destination>" << std::endl;
+        fprintf(stderr, "Usage: %s <source> <destination>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     std::string src = argv[1];
     std::string dest = argv[2];
 
-    if (!fs::exists(src)) {
-        std::cerr << "Source path does not exist." << std::endl;
+    struct stat src_stat;
+    if (stat(src.c_str(), &src_stat) == -1) {
+        perror("Source path does not exist");
         return EXIT_FAILURE;
     }
 
-    size_t num_threads = std::thread::hardware_concurrency();
-    for (size_t i = 0; i < num_threads; ++i) {
-        workers.emplace_back(worker_thread);
+    CopyTask *initial_task = (CopyTask *)malloc(sizeof(CopyTask));
+    initial_task->src = src;
+    initial_task->dest = dest;
+    initial_task->is_directory = S_ISDIR(src_stat.st_mode);
+
+    pthread_t initial_thread;
+    if (pthread_create(&initial_thread, nullptr, process_task, initial_task) != 0) {
+        perror("Failed to create initial thread");
+        free(initial_task);
+        return EXIT_FAILURE;
     }
 
-    if (fs::is_directory(src)) {
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            tasks.push(CopyTask{src, dest, true});
+    pthread_mutex_lock(&queue_mutex);
+    thread_queue.push(initial_thread);
+    pthread_mutex_unlock(&queue_mutex);
+
+    // Главный поток ожидает завершения всех созданных потоков
+    while (true) {
+        pthread_mutex_lock(&queue_mutex);
+        if (thread_queue.empty()) {
+            pthread_mutex_unlock(&queue_mutex);
+            break;
         }
-        condition.notify_one();
-    } else {
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            tasks.push(CopyTask{src, dest, false});
-        }
-        condition.notify_one();
+
+        pthread_t thread = thread_queue.front();
+        thread_queue.pop();
+        pthread_mutex_unlock(&queue_mutex);
+
+        pthread_join(thread, nullptr);
     }
 
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        stop = true;
-    }
-    condition.notify_all();
-
-    for (std::thread &worker : workers) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-
+    pthread_mutex_destroy(&queue_mutex);
     return EXIT_SUCCESS;
 }
