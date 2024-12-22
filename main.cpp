@@ -9,7 +9,6 @@
 #include <pthread.h>
 #include <queue>
 #include <string>
-#include <vector>
 
 struct CopyTask {
     std::string src;
@@ -21,13 +20,23 @@ std::queue<pthread_t> thread_queue;
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void copy_file(const std::string &src, const std::string &dest) {
-    int src_fd = open(src.c_str(), O_RDONLY);
+    int src_fd, dest_fd;
+
+    while ((src_fd = open(src.c_str(), O_RDONLY)) == -1 && errno == EMFILE) {
+        perror("Too many open files, retrying source open...");
+        sleep(1);
+    }
+
     if (src_fd == -1) {
         perror("Failed to open source file");
         return;
     }
 
-    int dest_fd = open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    while ((dest_fd = open(dest.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644)) == -1 && errno == EMFILE) {
+        perror("Too many open files, retrying destination open...");
+        sleep(1);
+    }
+
     if (dest_fd == -1) {
         perror("Failed to open destination file");
         close(src_fd);
@@ -56,7 +65,12 @@ void *process_task(void *arg) {
     CopyTask *task = (CopyTask *)arg;
 
     if (task->is_directory) {
-        DIR *dir = opendir(task->src.c_str());
+        DIR *dir;
+        while ((dir = opendir(task->src.c_str())) == nullptr && errno == EMFILE) {
+            perror("Too many open directories, retrying...");
+            sleep(1);
+        }
+
         if (!dir) {
             perror("Failed to open source directory");
             free(task);
@@ -70,14 +84,31 @@ void *process_task(void *arg) {
             return nullptr;
         }
 
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != nullptr) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+        long name_max = pathconf(task->src.c_str(), _PC_NAME_MAX);
+        if (name_max == -1) {
+            perror("Failed to get _PC_NAME_MAX");
+            closedir(dir);
+            free(task);
+            return nullptr;
+        }
+
+        size_t entry_size = sizeof(struct dirent) + name_max + 1;
+        struct dirent *entry = (struct dirent *)malloc(entry_size);
+        if (!entry) {
+            perror("Failed to allocate memory for directory entry");
+            closedir(dir);
+            free(task);
+            return nullptr;
+        }
+
+        struct dirent *result;
+        while (readdir_r(dir, entry, &result) == 0 && result) {
+            if (strcmp(result->d_name, ".") == 0 || strcmp(result->d_name, "..") == 0) {
                 continue;
             }
 
-            std::string new_src = task->src + "/" + entry->d_name;
-            std::string new_dest = task->dest + "/" + entry->d_name;
+            std::string new_src = task->src + "/" + result->d_name;
+            std::string new_dest = task->dest + "/" + result->d_name;
 
             struct stat entry_stat;
             if (stat(new_src.c_str(), &entry_stat) == -1) {
@@ -91,17 +122,19 @@ void *process_task(void *arg) {
             new_task->is_directory = S_ISDIR(entry_stat.st_mode);
 
             pthread_t thread;
-            if (pthread_create(&thread, nullptr, process_task, new_task) != 0) {
-                perror("Failed to create thread");
-                free(new_task);
-                continue;
+            while (true) {
+                if (pthread_create(&thread, nullptr, process_task, new_task) == 0) {
+                    pthread_mutex_lock(&queue_mutex);
+                    thread_queue.push(thread);
+                    pthread_mutex_unlock(&queue_mutex);
+                    break;
+                } else {
+                    perror("Failed to create thread, retrying...");
+                    sleep(1);
+                }
             }
-
-            pthread_mutex_lock(&queue_mutex);
-            thread_queue.push(thread);
-            pthread_mutex_unlock(&queue_mutex);
         }
-
+        free(entry);
         closedir(dir);
     } else {
         copy_file(task->src, task->dest);
